@@ -1,0 +1,1158 @@
+#!/usr/bin/env python3
+# CTLauncher 2.1 - Enhanced Minecraft Launcher exactly like TLauncher
+# © [C] Team Flames [C] - Samsoft [C] Mojang AB
+
+import os
+import sys
+import subprocess
+import platform
+import urllib.request
+import zipfile
+import json
+import shutil
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import re
+import hashlib
+import ssl
+import time
+import requests  # For dynamic Java version fetching
+import tarfile  # For Java extraction on non-Windows
+
+# Define constants for directories and URLs
+CTLAUNCHER_DIR = os.path.expanduser("~/.ctlauncher")
+VERSIONS_DIR = os.path.join(CTLAUNCHER_DIR, "versions")
+ACCOUNTS_FILE = os.path.join(CTLAUNCHER_DIR, "accounts.json")
+JAVA_DIR = os.path.expanduser("~/.ctlauncher/java")
+SKINS_DIR = os.path.join(CTLAUNCHER_DIR, "skins")
+ASSETS_DIR = os.path.join(CTLAUNCHER_DIR, "assets")
+VERSION_MANIFEST_URL = "https://launchermeta.mojang.com/mc/game/version_manifest.json"
+# Removed incorrect ASSETS_MANIFEST_URL; use assetIndex["url"] instead
+
+# Download settings
+MAX_RETRIES = 5
+RETRY_DELAY = 2  # seconds
+DOWNLOAD_TIMEOUT = 60  # seconds
+RATE_LIMIT_DELAY = 0.1  # seconds between downloads
+
+# TLauncher-inspired theme colors - Dark theme with green accents
+DARK_THEME = {
+    'bg': '#2d2d30',
+    'sidebar': '#252528',
+    'accent': '#00ff88',
+    'accent_light': '#00ffaa',
+    'text': '#ffffff',
+    'text_secondary': '#a0a0a0',
+    'button': '#00ff88',
+    'button_hover': '#00ffaa',
+    'input_bg': '#3a3a3c',
+    'header_bg': '#1e1e20',
+    'tab_active': '#00ff88',
+    'tab_inactive': '#2d2d30'
+}
+
+# Light theme (less used, but for completeness)
+LIGHT_THEME = {
+    'bg': '#f0f0f0',
+    'sidebar': '#e0e0e0',
+    'accent': '#00ff88',
+    'accent_light': '#00ffaa',
+    'text': '#000000',
+    'text_secondary': '#808080',
+    'button': '#00ff88',
+    'button_hover': '#00ffaa',
+    'input_bg': '#ffffff',
+    'header_bg': '#ffffff',
+    'tab_active': '#00ff88',
+    'tab_inactive': '#f0f0f0'
+}
+
+class CTLauncher(tk.Tk):
+    def __init__(self):
+        """Initialize the CTLauncher window and UI."""
+        super().__init__()
+        self.title("CTLauncher 2.1")
+        self.geometry("900x600")
+        self.minsize(800, 500)
+        self.themes = {'Dark': DARK_THEME, 'Light': LIGHT_THEME}
+        self.current_theme_mode = 'Dark'
+        self.theme = self.themes[self.current_theme_mode]
+        self.configure(bg=self.theme['bg'])
+        self.versions = {}  # Dictionary to store version IDs and their URLs
+        self.installed_versions = []  # List of installed versions
+        self.accounts = self.load_accounts()  # Load saved accounts
+        self.current_account = "Player" if not self.accounts else list(self.accounts.keys())[0]
+        self.version_categories = {
+            "Latest Release": [],
+            "Latest Snapshot": [],
+            "Release": [],
+            "Snapshot": [],
+            "Old Beta": [],
+            "Old Alpha": []
+        }
+        
+        # Configure styles
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+        self.apply_theme_styles()
+        self.init_ui()
+        self.load_version_manifest()
+
+    def load_accounts(self):
+        """Load saved accounts from JSON file."""
+        if os.path.exists(ACCOUNTS_FILE):
+            try:
+                with open(ACCOUNTS_FILE, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def save_accounts(self):
+        """Save accounts to JSON file."""
+        os.makedirs(os.path.dirname(ACCOUNTS_FILE), exist_ok=True)
+        with open(ACCOUNTS_FILE, 'w') as f:
+            json.dump(self.accounts, f)
+
+    def add_account(self):
+        """Add a new account via dialog."""
+        dialog = tk.Toplevel(self)
+        dialog.title("Add Account")
+        dialog.geometry("300x150")
+        dialog.configure(bg=self.theme['bg'])
+
+        tk.Label(dialog, text="Username:", bg=self.theme['bg'], fg=self.theme['text']).pack(pady=10)
+        username_entry = tk.Entry(dialog, bg=self.theme['input_bg'], fg=self.theme['text'])
+        username_entry.pack(pady=5)
+
+        def save():
+            username = username_entry.get().strip()
+            if username:
+                self.accounts[username] = {"uuid": self.generate_offline_uuid(username)}
+                self.save_accounts()
+                self.account_combo['values'] = list(self.accounts.keys())
+                self.account_combo.set(username)
+                self.current_account = username
+                dialog.destroy()
+            else:
+                messagebox.showerror("Error", "Username cannot be empty.")
+
+        tk.Button(dialog, text="Save", command=save, bg=self.theme['button'], fg=self.theme['text']).pack(pady=10)
+
+    def apply_theme_styles(self):
+        """Apply theme to ttk styles."""
+        self.style.configure("TFrame", background=self.theme['bg'])
+        self.style.configure("TLabel", background=self.theme['bg'], foreground=self.theme['text'])
+        self.style.configure("TButton",
+                             background=self.theme['button'],
+                             foreground=self.theme['text'],
+                             borderwidth=0,
+                             focuscolor='none')
+        self.style.map("TButton",
+                       background=[('active', self.theme['button_hover']),
+                                   ('pressed', self.theme['accent'])])
+        
+        self.style.configure("TCombobox",
+                             fieldbackground=self.theme['input_bg'],
+                             background=self.theme['input_bg'],
+                             foreground=self.theme['text'],
+                             arrowcolor=self.theme['text'],
+                             borderwidth=0)
+        
+        self.style.configure("TScale",
+                             background=self.theme['bg'],
+                             troughcolor=self.theme['input_bg'])
+        
+        self.style.configure("TNotebook",
+                             background=self.theme['header_bg'],
+                             borderwidth=0)
+        self.style.configure("TNotebook.Tab",
+                             background=self.theme['tab_inactive'],
+                             foreground=self.theme['text_secondary'],
+                             padding=[15, 8],
+                             borderwidth=0)
+        self.style.map("TNotebook.Tab",
+                       background=[('selected', self.theme['tab_active'])],
+                       foreground=[('selected', self.theme['text'])])
+
+    def init_ui(self):
+        """Set up the graphical user interface exactly like TLauncher."""
+        # Footer branding (TLauncher style)
+        self.footer = tk.Label(self, text="© [C] Team Flames [C] - Samsoft [C] Mojang AB", 
+                               font=("Arial", 8), bg=self.theme['bg'], fg=self.theme['text_secondary'])
+        self.footer.pack(side="bottom", fill="x")
+
+        # Header (TLauncher: logo, search, theme toggle)
+        self.header = tk.Frame(self, bg=self.theme['header_bg'], height=50)
+        self.header.pack(fill="x", side="top")
+        self.header.pack_propagate(False)
+        
+        # Logo
+        self.title_label = tk.Label(self.header, text="CTLauncher", font=("Arial", 16, "bold"),
+                                    bg=self.theme['header_bg'], fg=self.theme['accent'])
+        self.title_label.pack(side="left", padx=15, pady=15)
+        
+        # Search bar (TLauncher has search for versions/mods)
+        search_frame = tk.Frame(self.header, bg=self.theme['header_bg'])
+        search_frame.pack(side="left", padx=10)
+        self.search_entry = tk.Entry(search_frame, bg=self.theme['input_bg'], fg=self.theme['text'], width=30)
+        self.search_entry.pack(side="left")
+        tk.Button(search_frame, text="Search", bg=self.theme['button'], fg=self.theme['text'], width=8).pack(side="left", padx=5)
+        self.search_entry.bind('<KeyRelease>', self.search_versions)
+        
+        # Version label
+        self.version_label = tk.Label(self.header, text="v2.1", font=("Arial", 10),
+                                      bg=self.theme['header_bg'], fg=self.theme['text_secondary'])
+        self.version_label.pack(side="right", padx=15, pady=15)
+        
+        # Theme toggler (gear/settings like TLauncher)
+        theme_frame = tk.Frame(self.header, bg=self.theme['header_bg'])
+        theme_frame.pack(side="right", padx=10, pady=10)
+        theme_label = tk.Label(theme_frame, text="Theme:", font=("Arial", 10),
+                               bg=self.theme['header_bg'], fg=self.theme['text_secondary'])
+        theme_label.pack(side="left")
+        self.theme_combo = ttk.Combobox(theme_frame, values=['Dark', 'Light', 'System'],
+                                        state="readonly", width=8, font=("Arial", 10))
+        self.theme_combo.pack(side="left")
+        self.theme_combo.set(self.current_theme_mode)
+        self.theme_combo.bind("<<ComboboxSelected>>", self.change_theme)
+        
+        # Main container
+        self.main_container = tk.Frame(self, bg=self.theme['bg'])
+        self.main_container.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Left panel - Sidebar exactly like TLauncher
+        self.left_panel = tk.Frame(self.main_container, bg=self.theme['sidebar'], width=300)
+        self.left_panel.pack(side="left", fill="y", padx=(0, 10))
+        self.left_panel.pack_propagate(False)
+        
+        # Account settings (dropdown with + like TLauncher)
+        self.account_frame = tk.Frame(self.left_panel, bg=self.theme['sidebar'])
+        self.account_frame.pack(fill="x", padx=15, pady=15)
+        
+        tk.Label(self.account_frame, text="ACCOUNT", font=("Arial", 9, "bold"),
+                 bg=self.theme['sidebar'], fg=self.theme['text_secondary']).pack(anchor="w")
+        
+        account_combo_frame = tk.Frame(self.account_frame, bg=self.theme['sidebar'])
+        account_combo_frame.pack(fill="x", pady=(5, 0))
+        
+        self.account_combo = ttk.Combobox(account_combo_frame, state="readonly", font=("Arial", 10))
+        self.account_combo['values'] = list(self.accounts.keys()) or ["Player"]
+        self.account_combo.set(self.current_account)
+        self.account_combo.pack(side="left", fill="x", expand=True)
+        self.account_combo.bind("<<ComboboxSelected>>", lambda e: setattr(self, 'current_account', self.account_combo.get()))
+        
+        add_account_btn = tk.Button(account_combo_frame, text="+", font=("Arial", 10, "bold"),
+                                    bg=self.theme['button'], fg=self.theme['text'], width=2, command=self.add_account)
+        add_account_btn.pack(side="right")
+        
+        # Game version selection (category + version dropdown like TLauncher)
+        self.version_frame = tk.Frame(self.left_panel, bg=self.theme['sidebar'])
+        self.version_frame.pack(fill="x", padx=15, pady=10)
+        
+        tk.Label(self.version_frame, text="VERSION", font=("Arial", 9, "bold"),
+                 bg=self.theme['sidebar'], fg=self.theme['text_secondary']).pack(anchor="w")
+        
+        self.category_combo = ttk.Combobox(self.version_frame, values=list(self.version_categories.keys()),
+                                           state="readonly", font=("Arial", 10))
+        self.category_combo.pack(fill="x", pady=(5, 0))
+        self.category_combo.set("Latest Release")
+        self.category_combo.bind("<<ComboboxSelected>>", self.update_version_list)
+        
+        self.version_combo = ttk.Combobox(self.version_frame, state="readonly", font=("Arial", 10))
+        self.version_combo.pack(fill="x", pady=5)
+        
+        # RAM settings (slider with label like TLauncher)
+        self.ram_frame = tk.Frame(self.left_panel, bg=self.theme['sidebar'])
+        self.ram_frame.pack(fill="x", padx=15, pady=10)
+        
+        self.ram_header = tk.Frame(self.ram_frame, bg=self.theme['sidebar'])
+        self.ram_header.pack(fill="x")
+        
+        tk.Label(self.ram_header, text="RAM", font=("Arial", 9, "bold"),
+                 bg=self.theme['sidebar'], fg=self.theme['text_secondary']).pack(side="left")
+        
+        self.ram_value_label = tk.Label(self.ram_header, text="4 GB", font=("Arial", 9),
+                                        bg=self.theme['sidebar'], fg=self.theme['text'])
+        self.ram_value_label.pack(side="right")
+        
+        self.ram_scale = tk.Scale(self.ram_frame, from_=1, to=16, orient="horizontal",
+                                  bg=self.theme['sidebar'], fg=self.theme['text'],
+                                  activebackground=self.theme['accent'],
+                                  highlightthickness=0, bd=0,
+                                  troughcolor=self.theme['input_bg'],
+                                  sliderrelief="flat",
+                                  command=lambda v: self.ram_value_label.config(text=f"{int(float(v))} GB"))
+        self.ram_scale.set(4)
+        self.ram_scale.pack(fill="x")
+        
+        # Skin button (like TLauncher)
+        skin_button = tk.Button(self.left_panel, text="Change Skin", font=("Arial", 10),
+                                bg=self.theme['button'], fg=self.theme['text'],
+                                bd=0, padx=20, pady=8, command=self.select_skin)
+        skin_button.pack(padx=15, pady=10, fill="x")
+        
+        # Launch button (green PLAY like TLauncher)
+        launch_button = tk.Button(self.left_panel, text="PLAY", font=("Arial", 12, "bold"),
+                                  bg=self.theme['accent'], fg=self.theme['text'],
+                                  bd=0, padx=20, pady=12, command=self.prepare_and_launch)
+        launch_button.pack(side="bottom", padx=15, pady=15, fill="x")
+        
+        # Right panel - Tabs exactly like TLauncher: News, Versions, Skins, Mods, Settings (added Maps, Resource Packs)
+        self.right_panel = tk.Frame(self.main_container, bg=self.theme['bg'])
+        self.right_panel.pack(side="left", fill="both", expand=True)
+        
+        # Create notebook for tabs
+        self.notebook = ttk.Notebook(self.right_panel)
+        self.notebook.pack(fill="both", expand=True)
+        
+        # News tab
+        self.news_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.news_tab, text="News")
+        self.populate_news_tab()
+        
+        # Versions tab
+        self.versions_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.versions_tab, text="Versions")
+        self.populate_versions_tab()
+        
+        # Installations tab (like TLauncher installations)
+        self.installations_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.installations_tab, text="Installations")
+        self.populate_installations_tab()
+        
+        # Mods tab
+        self.mods_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.mods_tab, text="Mods")
+        self.populate_mods_tab()
+        
+        # Skins tab
+        self.skins_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.skins_tab, text="Skins")
+        self.populate_skins_tab()
+        
+        # Maps tab (TLauncher has maps)
+        self.maps_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.maps_tab, text="Maps")
+        self.populate_maps_tab()
+        
+        # Resource Packs tab
+        self.resource_packs_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.resource_packs_tab, text="Resource Packs")
+        self.populate_resource_packs_tab()
+        
+        # Settings tab
+        self.settings_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.settings_tab, text="Settings")
+        self.populate_settings_tab()
+
+    def populate_news_tab(self):
+        """Populate the News tab with highlights."""
+        news_content = tk.Frame(self.news_tab, bg=self.theme['bg'])
+        news_content.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        news_title = tk.Label(news_content, text="CTLauncher News",
+                              font=("Arial", 16, "bold"), bg=self.theme['bg'], fg=self.theme['accent'])
+        news_title.pack(anchor="w", pady=(0, 15))
+        
+        news_items = [
+            "CTLauncher 2.1: Enhanced with multi-account support",
+            "One-click modpack installation system",
+            "Improved Java auto-installation for OpenJDK 21+",
+            "Custom skin gallery with previews",
+            "Full version categorization and installations management",
+            "Dark/Light themes with system sync",
+            "Optimized downloads with retry logic and checksums",
+            "TLauncher-inspired UI for seamless experience"
+        ]
+        for item in news_items:
+            item_frame = tk.Frame(news_content, bg=self.theme['bg'])
+            item_frame.pack(fill="x", pady=2)
+            tk.Label(item_frame, text="• " + item, font=("Arial", 10),
+                     bg=self.theme['bg'], fg=self.theme['text'], justify="left", anchor="w").pack(fill='x')
+
+    def populate_versions_tab(self):
+        """Populate the Versions tab with listbox."""
+        versions_content = tk.Frame(self.versions_tab, bg=self.theme['bg'])
+        versions_content.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        versions_title = tk.Label(versions_content, text="AVAILABLE VERSIONS",
+                                  font=("Arial", 12, "bold"), bg=self.theme['bg'], fg=self.theme['text'])
+        versions_title.pack(anchor="w", pady=(0, 10))
+        
+        # Version listbox with scrollbar
+        version_list_frame = tk.Frame(versions_content, bg=self.theme['bg'])
+        version_list_frame.pack(fill="both", expand=True)
+        
+        scrollbar = ttk.Scrollbar(version_list_frame)
+        scrollbar.pack(side="right", fill="y")
+        
+        self.version_listbox = tk.Listbox(version_list_frame, bg=self.theme['input_bg'], fg=self.theme['text'],
+                                          selectbackground=self.theme['accent'], selectforeground=self.theme['text'],
+                                          yscrollcommand=scrollbar.set, font=("Arial", 10), bd=0)
+        self.version_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=self.version_listbox.yview)
+        
+        # Bind double-click to install
+        self.version_listbox.bind('<Double-1>', lambda e: self.install_from_listbox())
+        
+        self.update_version_listbox()
+
+    def populate_installations_tab(self):
+        """Populate the Installations tab with installed versions."""
+        installations_content = tk.Frame(self.installations_tab, bg=self.theme['bg'])
+        installations_content.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        title = tk.Label(installations_content, text="INSTALLED VERSIONS",
+                         font=("Arial", 12, "bold"), bg=self.theme['bg'], fg=self.theme['text'])
+        title.pack(anchor="w", pady=(0, 10))
+        
+        # Listbox for installations
+        list_frame = tk.Frame(installations_content, bg=self.theme['bg'])
+        list_frame.pack(fill="both", expand=True)
+        
+        scrollbar = ttk.Scrollbar(list_frame)
+        scrollbar.pack(side="right", fill="y")
+        
+        self.installations_listbox = tk.Listbox(list_frame, bg=self.theme['input_bg'], fg=self.theme['text'],
+                                                selectbackground=self.theme['accent'], selectforeground=self.theme['text'],
+                                                yscrollcommand=scrollbar.set, font=("Arial", 10), bd=0)
+        self.installations_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=self.installations_listbox.yview)
+        
+        # Buttons (Play, Delete like TLauncher)
+        btn_frame = tk.Frame(installations_content, bg=self.theme['bg'])
+        btn_frame.pack(fill="x", pady=10)
+        
+        tk.Button(btn_frame, text="Play", command=self.play_from_installations, bg=self.theme['button'], fg=self.theme['text']).pack(side="left", padx=5)
+        tk.Button(btn_frame, text="Delete", command=self.delete_installation, bg=self.theme['button'], fg=self.theme['text']).pack(side="left", padx=5)
+        
+        self.update_installations_listbox()
+
+    def populate_mods_tab(self):
+        """Populate the Mods tab with Forge/Fabric install buttons (TLauncher style placeholders)."""
+        mods_content = tk.Frame(self.mods_tab, bg=self.theme['bg'])
+        mods_content.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        title = tk.Label(mods_content, text="MODS & MODPACKS",
+                         font=("Arial", 12, "bold"), bg=self.theme['bg'], fg=self.theme['text'])
+        title.pack(anchor="w", pady=(0, 10))
+        
+        # Forge button
+        forge_btn = tk.Button(mods_content, text="Install Forge", font=("Arial", 12, "bold"),
+                              bg=self.theme['accent'], fg=self.theme['text'], pady=10, command=self.install_forge)
+        forge_btn.pack(fill="x", pady=5)
+        
+        # Fabric button
+        fabric_btn = tk.Button(mods_content, text="Install Fabric", font=("Arial", 12, "bold"),
+                               bg=self.theme['accent'], fg=self.theme['text'], pady=10, command=self.install_fabric)
+        fabric_btn.pack(fill="x", pady=5)
+        
+        # Modpack note
+        note = tk.Label(mods_content, text="Note: Modpacks coming soon with one-click install.",
+                        bg=self.theme['bg'], fg=self.theme['text_secondary'], font=("Arial", 10))
+        note.pack(pady=20)
+
+    def populate_skins_tab(self):
+        """Populate the Skins tab with skin list and preview (TLauncher gallery style)."""
+        skins_content = tk.Frame(self.skins_tab, bg=self.theme['bg'])
+        skins_content.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        title = tk.Label(skins_content, text="SKINS GALLERY",
+                         font=("Arial", 12, "bold"), bg=self.theme['bg'], fg=self.theme['text'])
+        title.pack(anchor="w", pady=(0, 10))
+        
+        # Preview label
+        self.skin_preview = tk.Label(skins_content, bg=self.theme['input_bg'], width=20, height=10)
+        self.skin_preview.pack(pady=10)
+        
+        # Skins listbox
+        list_frame = tk.Frame(skins_content, bg=self.theme['bg'])
+        list_frame.pack(fill="both", expand=True)
+        
+        scrollbar = ttk.Scrollbar(list_frame)
+        scrollbar.pack(side="right", fill="y")
+        
+        self.skins_listbox = tk.Listbox(list_frame, bg=self.theme['input_bg'], fg=self.theme['text'],
+                                        selectbackground=self.theme['accent'], selectforeground=self.theme['text'],
+                                        yscrollcommand=scrollbar.set, font=("Arial", 10), bd=0)
+        self.skins_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=self.skins_listbox.yview)
+        
+        self.skins_listbox.bind('<<ListboxSelect>>', self.preview_skin)
+        
+        upload_btn = tk.Button(skins_content, text="Upload Skin", command=self.select_skin,
+                               bg=self.theme['button'], fg=self.theme['text'])
+        upload_btn.pack(pady=10)
+        
+        self.update_skins_listbox()
+
+    def populate_maps_tab(self):
+        """Populate Maps tab (placeholder like TLauncher)."""
+        maps_content = tk.Frame(self.maps_tab, bg=self.theme['bg'])
+        maps_content.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        title = tk.Label(maps_content, text="MAPS",
+                         font=("Arial", 12, "bold"), bg=self.theme['bg'], fg=self.theme['text'])
+        title.pack(anchor="w", pady=(0, 10))
+        
+        note = tk.Label(maps_content, text="Maps catalog coming soon.",
+                        bg=self.theme['bg'], fg=self.theme['text_secondary'], font=("Arial", 10))
+        note.pack(pady=20)
+
+    def populate_resource_packs_tab(self):
+        """Populate Resource Packs tab (placeholder like TLauncher)."""
+        rp_content = tk.Frame(self.resource_packs_tab, bg=self.theme['bg'])
+        rp_content.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        title = tk.Label(rp_content, text="RESOURCE PACKS",
+                         font=("Arial", 12, "bold"), bg=self.theme['bg'], fg=self.theme['text'])
+        title.pack(anchor="w", pady=(0, 10))
+        
+        note = tk.Label(rp_content, text="Resource packs catalog coming soon.",
+                        bg=self.theme['bg'], fg=self.theme['text_secondary'], font=("Arial", 10))
+        note.pack(pady=20)
+
+    def populate_settings_tab(self):
+        """Populate the Settings tab (gear icon style like TLauncher)."""
+        settings_content = tk.Frame(self.settings_tab, bg=self.theme['bg'])
+        settings_content.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        settings_title = tk.Label(settings_content, text="CTLAUNCHER SETTINGS",
+                                  font=("Arial", 12, "bold"), bg=self.theme['bg'], fg=self.theme['text'])
+        settings_title.pack(anchor="w", pady=(0, 10))
+        
+        # Settings options
+        settings_options = [
+            ("Auto-update CTLauncher", tk.BooleanVar(value=True)),
+            ("Close launcher when game starts", tk.BooleanVar(value=False)),
+            ("Keep launcher open (recommended)", tk.BooleanVar(value=True)),
+            ("Check for Java updates", tk.BooleanVar(value=True))
+        ]
+        self.settings_vars = {}
+        for text, var in settings_options:
+            cb = tk.Checkbutton(settings_content, text=text, variable=var,
+                                bg=self.theme['bg'], fg=self.theme['text'], selectcolor=self.theme['sidebar'],
+                                activebackground=self.theme['bg'], activeforeground=self.theme['text'])
+            cb.pack(anchor="w", pady=5)
+            self.settings_vars[text] = var
+        
+        # Game directory setting
+        dir_frame = tk.Frame(settings_content, bg=self.theme['bg'])
+        dir_frame.pack(fill="x", pady=10)
+        
+        tk.Label(dir_frame, text="Game Directory:", bg=self.theme['bg'], fg=self.theme['text']).pack(anchor="w")
+        
+        self.dir_entry = tk.Entry(dir_frame, bg=self.theme['input_bg'], fg=self.theme['text'],
+                                  insertbackground=self.theme['text'], bd=0)
+        self.dir_entry.insert(0, CTLAUNCHER_DIR)
+        self.dir_entry.pack(fill="x", pady=(5, 0))
+        
+        browse_btn = tk.Button(dir_frame, text="Browse", command=self.browse_directory,
+                               bg=self.theme['button'], fg=self.theme['text'])
+        browse_btn.pack(pady=5)
+        
+        # Language selection (TLauncher supports multiple langs)
+        lang_frame = tk.Frame(settings_content, bg=self.theme['bg'])
+        lang_frame.pack(fill="x", pady=10)
+        
+        tk.Label(lang_frame, text="Language:", bg=self.theme['bg'], fg=self.theme['text']).pack(anchor="w")
+        self.lang_combo = ttk.Combobox(lang_frame, values=['English', 'Russian', 'Ukrainian'], state="readonly")
+        self.lang_combo.set('English')
+        self.lang_combo.pack(fill="x", pady=(5, 0))
+
+    def browse_directory(self):
+        """Browse for game directory."""
+        dir_path = filedialog.askdirectory()
+        if dir_path:
+            self.dir_entry.delete(0, tk.END)
+            self.dir_entry.insert(0, dir_path)
+
+    def install_forge(self):
+        """Placeholder for Forge installation (TLauncher one-click)."""
+        messagebox.showinfo("Mods", "Forge installation coming soon! Download manually from official site.")
+
+    def install_fabric(self):
+        """Placeholder for Fabric installation."""
+        messagebox.showinfo("Mods", "Fabric installation coming soon! Download manually from official site.")
+
+    def search_versions(self, event=None):
+        """Search versions in listbox (TLauncher search)."""
+        query = self.search_entry.get().lower()
+        self.version_listbox.delete(0, tk.END)
+        category = self.category_combo.get()
+        for version in self.version_categories.get(category, []):
+            if query in version.lower():
+                self.version_listbox.insert(tk.END, version)
+
+    def update_skins_listbox(self):
+        """Update skins listbox."""
+        self.skins_listbox.delete(0, tk.END)
+        if os.path.exists(SKINS_DIR):
+            for skin_file in os.listdir(SKINS_DIR):
+                if skin_file.endswith('.png'):
+                    self.skins_listbox.insert(tk.END, skin_file)
+
+    def preview_skin(self, event):
+        """Preview selected skin."""
+        selection = self.skins_listbox.curselection()
+        if selection:
+            skin_name = self.skins_listbox.get(selection[0])
+            skin_path = os.path.join(SKINS_DIR, skin_name)
+            try:
+                img = tk.PhotoImage(file=skin_path).subsample(4, 4)  # Resize for preview
+                self.skin_preview.configure(image=img)
+                self.skin_preview.image = img  # Keep reference
+            except Exception:
+                pass
+
+    def update_installations_listbox(self):
+        """Update installations listbox (avoids duplicates)."""
+        self.installations_listbox.delete(0, tk.END)
+        self.installed_versions = []
+        if os.path.exists(VERSIONS_DIR):
+            for version_dir in os.listdir(VERSIONS_DIR):
+                if os.path.isdir(os.path.join(VERSIONS_DIR, version_dir)):
+                    self.installed_versions.append(version_dir)
+                    self.installations_listbox.insert(tk.END, version_dir)
+
+    def play_from_installations(self):
+        """Play selected installation."""
+        selection = self.installations_listbox.curselection()
+        if selection:
+            version = self.installations_listbox.get(selection[0])
+            self.version_combo.set(version)
+            self.prepare_and_launch()
+
+    def delete_installation(self):
+        """Delete selected installation."""
+        selection = self.installations_listbox.curselection()
+        if selection and messagebox.askyesno("Confirm", "Delete this installation?"):
+            version = self.installations_listbox.get(selection[0])
+            shutil.rmtree(os.path.join(VERSIONS_DIR, version))
+            self.update_installations_listbox()
+
+    def install_from_listbox(self):
+        """Install version from versions listbox."""
+        selection = self.version_listbox.curselection()
+        if selection:
+            version = self.version_listbox.get(selection[0])
+            self.version_combo.set(version)
+            self.download_and_launch(install_only=True)
+
+    def change_theme(self, event=None):
+        """Handle theme change."""
+        mode = self.theme_combo.get()
+        if mode == 'System':
+            detected = self.detect_system_mode()
+            self.theme = self.themes[detected]
+            self.current_theme_mode = detected
+        else:
+            self.theme = self.themes[mode]
+            self.current_theme_mode = mode
+        self.apply_theme()
+
+    def detect_system_mode(self):
+        """Detect system theme (enhanced for macOS/Linux)."""
+        system = platform.system()
+        if system == 'Windows':
+            try:
+                from winreg import OpenKey, QueryValueEx, CloseKey, HKEY_CURRENT_USER
+                key = OpenKey(HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+                value, _ = QueryValueEx(key, "AppsUseLightTheme")
+                CloseKey(key)
+                return 'Light' if value == 1 else 'Dark'
+            except:
+                return 'Dark'
+        elif system == 'Darwin':  # macOS
+            try:
+                output = subprocess.check_output(["defaults", "read", "-g", "AppleInterfaceStyle"])
+                return 'Dark' if b'Dark' in output else 'Light'
+            except:
+                return 'Dark'
+        elif system == 'Linux':
+            try:
+                output = subprocess.check_output(["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"])
+                return 'Dark' if 'dark' in output.decode().lower() else 'Light'
+            except:
+                return 'Dark'
+        return 'Dark'
+
+    def apply_theme(self):
+        """Apply theme recursively (improved for stability)."""
+        self.configure(bg=self.theme['bg'])
+        self.apply_theme_styles()
+        
+        def update_rec(widget):
+            try:
+                if isinstance(widget, (tk.Frame, ttk.Frame)):
+                    if hasattr(widget, 'winfo_name') and 'left_panel' in widget.winfo_name():
+                        widget.configure(bg=self.theme['sidebar'])
+                    else:
+                        widget.configure(bg=self.theme['bg'])
+                elif isinstance(widget, tk.Label):
+                    widget.configure(fg=self.theme['text'])
+                elif isinstance(widget, tk.Button):
+                    widget.configure(bg=self.theme['button'], fg=self.theme['text'])
+                elif isinstance(widget, tk.Entry):
+                    widget.configure(bg=self.theme['input_bg'], fg=self.theme['text'])
+                elif isinstance(widget, tk.Listbox):
+                    widget.configure(bg=self.theme['input_bg'], fg=self.theme['text'])
+                elif isinstance(widget, tk.Checkbutton):
+                    widget.configure(fg=self.theme['text'])
+                elif isinstance(widget, tk.Scale):
+                    widget.configure(fg=self.theme['text'], troughcolor=self.theme['input_bg'])
+            except:
+                pass
+            for child in widget.winfo_children():
+                update_rec(child)
+        
+        update_rec(self)
+        self.footer.configure(bg=self.theme['bg'], fg=self.theme['text_secondary'])
+        self.header.configure(bg=self.theme['header_bg'])
+
+    def update_version_list(self, event=None):
+        """Update version combo based on category."""
+        category = self.category_combo.get()
+        if self.version_categories[category]:
+            self.version_combo['values'] = self.version_categories[category]
+            self.version_combo.current(0)
+        self.update_version_listbox()
+
+    def update_version_listbox(self):
+        """Update versions listbox."""
+        self.version_listbox.delete(0, tk.END)
+        category = self.category_combo.get()
+        for version in self.version_categories.get(category, []):
+            self.version_listbox.insert(tk.END, version)
+
+    def download_with_retry(self, url, output_path, description="file", expected_sha1=None):
+        """Download with retries and checksum (TLauncher stability)."""
+        for attempt in range(MAX_RETRIES):
+            try:
+                print(f"Downloading {description} (attempt {attempt + 1})...")
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                req = urllib.request.Request(url, headers={'User-Agent': 'CTLauncher/2.1'})
+                with urllib.request.urlopen(req, context=ssl_context, timeout=DOWNLOAD_TIMEOUT) as response:
+                    with open(output_path, 'wb') as out_file:
+                        out_file.write(response.read())
+                if expected_sha1 and not self.verify_file(output_path, expected_sha1):
+                    os.remove(output_path)
+                    continue
+                print(f"Downloaded {description}!")
+                time.sleep(RATE_LIMIT_DELAY)
+                return True
+            except Exception as e:
+                print(f"Error downloading {description}: {e}")
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (2 ** attempt))
+        return False
+
+    def load_version_manifest(self):
+        """Load version manifest from Mojang."""
+        try:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            req = urllib.request.Request(VERSION_MANIFEST_URL, headers={'User-Agent': 'CTLauncher/2.1'})
+            with urllib.request.urlopen(req, context=ssl_context, timeout=10) as url:
+                manifest = json.loads(url.read().decode())
+                
+                # Categorize
+                for category in self.version_categories:
+                    self.version_categories[category] = []
+                
+                latest_release = manifest["latest"]["release"]
+                latest_snapshot = manifest["latest"]["snapshot"]
+                
+                for v in manifest["versions"]:
+                    self.versions[v["id"]] = v["url"]
+                    if v["id"] == latest_release:
+                        self.version_categories["Latest Release"].append(v["id"])
+                    elif v["id"] == latest_snapshot:
+                        self.version_categories["Latest Snapshot"].append(v["id"])
+                    elif v["type"] == "release":
+                        self.version_categories["Release"].append(v["id"])
+                    elif v["type"] == "snapshot":
+                        self.version_categories["Snapshot"].append(v["id"])
+                    elif v["type"] == "old_beta":
+                        self.version_categories["Old Beta"].append(v["id"])
+                    elif v["type"] == "old_alpha":
+                        self.version_categories["Old Alpha"].append(v["id"])
+                
+                self.update_version_list()
+                self.update_installations_listbox()
+                print("Version manifest loaded!")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load versions: {e}")
+
+    def get_latest_java_url(self):
+        """Fetch latest OpenJDK 21 URL."""
+        try:
+            response = requests.get("https://api.adoptium.net/v3/assets/latest/21/hotspot", timeout=10)
+            releases = response.json()
+            system = platform.system()
+            arch = "x64"
+            os_map = {"Windows": "windows", "Linux": "linux", "Darwin": "mac"}
+            os_name = os_map.get(system)
+            if os_name:
+                for release in releases:
+                    if release["binary"]["os"] == os_name and release["binary"]["architecture"] == arch:
+                        return release["binary"]["package"]["link"], release["version"]["openjdk_version"]
+        except Exception as e:
+            print(f"Failed to fetch Java: {e}")
+        return None, None
+
+    def is_java_installed(self, required_version="21"):
+        """Check Java version."""
+        try:
+            result = subprocess.run(["java", "-version"], capture_output=True, text=True)
+            match = re.search(r'version "(\d+)', result.stderr)
+            if match and int(match.group(1)) >= int(required_version):
+                return True
+        except:
+            pass
+        # Check local
+        java_bin = os.path.join(JAVA_DIR, self.get_local_java_dir(), "bin", "java" + (".exe" if platform.system() == "Windows" else ""))
+        if os.path.exists(java_bin):
+            result = subprocess.run([java_bin, "-version"], capture_output=True, text=True)
+            match = re.search(r'version "(\d+)', result.stderr)
+            return match and int(match.group(1)) >= int(required_version)
+        return False
+
+    def get_local_java_dir(self):
+        """Get local Java dir."""
+        if os.path.exists(JAVA_DIR):
+            for dir_name in os.listdir(JAVA_DIR):
+                if dir_name.startswith("jdk-") and os.path.isdir(os.path.join(JAVA_DIR, dir_name)):
+                    return dir_name
+        return "jdk-21.0.5+11"  # Fallback
+
+    def install_java_if_needed(self):
+        """Install Java if needed."""
+        if self.is_java_installed():
+            return
+        print("Installing Java...")
+        java_url, _ = self.get_latest_java_url()
+        if not java_url:
+            messagebox.showerror("Error", "Failed to fetch Java URL.")
+            return
+        archive_ext = "zip" if platform.system() == "Windows" else "tar.gz"
+        archive_path = os.path.join(JAVA_DIR, f"openjdk.{archive_ext}")
+        os.makedirs(JAVA_DIR, exist_ok=True)
+        if not self.download_with_retry(java_url, archive_path, "Java 21"):
+            messagebox.showerror("Error", "Failed to download Java.")
+            return
+        try:
+            if platform.system() == "Windows":
+                with zipfile.ZipFile(archive_path, "r") as zip_ref:
+                    zip_ref.extractall(JAVA_DIR)
+            else:
+                with tarfile.open(archive_path, "r:gz") as tar_ref:
+                    tar_ref.extractall(JAVA_DIR)
+                java_bin = os.path.join(JAVA_DIR, self.get_local_java_dir(), "bin", "java")
+                os.chmod(java_bin, 0o755)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to extract Java: {e}")
+            return
+        os.remove(archive_path)
+        print("Java installed!")
+
+    def select_skin(self):
+        """Select and copy skin."""
+        file_path = filedialog.askopenfilename(filetypes=[("PNG Files", "*.png")])
+        if file_path:
+            os.makedirs(SKINS_DIR, exist_ok=True)
+            shutil.copy(file_path, os.path.join(SKINS_DIR, os.path.basename(file_path)))
+            self.update_skins_listbox()
+            messagebox.showinfo("Success", "Skin uploaded!")
+
+    @staticmethod
+    def verify_file(file_path, expected_sha1):
+        """Verify SHA1."""
+        try:
+            with open(file_path, "rb") as f:
+                return hashlib.sha1(f.read()).hexdigest() == expected_sha1
+        except:
+            return False
+
+    def download_version_files(self, version_id, version_url, install_only=False):
+        """Download version files (full assets implementation)."""
+        print(f"Downloading {version_id}...")
+        version_dir = os.path.join(VERSIONS_DIR, version_id)
+        os.makedirs(version_dir, exist_ok=True)
+        
+        # Version JSON
+        version_json_path = os.path.join(version_dir, f"{version_id}.json")
+        if not self.download_with_retry(version_url, version_json_path, f"{version_id} JSON"):
+            return False
+        
+        with open(version_json_path, "r") as f:
+            data = json.load(f)
+        
+        # Client JAR
+        jar_url = data["downloads"]["client"]["url"]
+        jar_path = os.path.join(version_dir, f"{version_id}.jar")
+        expected_sha1 = data["downloads"]["client"]["sha1"]
+        if not os.path.exists(jar_path) or not self.verify_file(jar_path, expected_sha1):
+            if not self.download_with_retry(jar_url, jar_path, f"{version_id} JAR", expected_sha1):
+                return False
+        
+        # Assets (full implementation)
+        asset_index = data.get("assetIndex", {})
+        if asset_index:
+            os.makedirs(ASSETS_DIR, exist_ok=True)
+            # Download asset index using correct URL and verify SHA1
+            index_url = asset_index["url"]
+            index_path = os.path.join(ASSETS_DIR, f"{asset_index['id']}.json")
+            index_sha1 = asset_index.get("sha1")
+            if not self.download_with_retry(index_url, index_path, f"Assets index {asset_index['id']}", index_sha1):
+                return False
+            
+            # Download individual assets
+            if os.path.exists(index_path):
+                with open(index_path, "r") as f:
+                    assets_data = json.load(f)
+                print("Downloading assets...")
+                objects_dir = os.path.join(ASSETS_DIR, "objects")
+                os.makedirs(objects_dir, exist_ok=True)
+                total_assets = len(assets_data.get("objects", {}))
+                downloaded = 0
+                for obj_name, obj_info in assets_data.get("objects", {}).items():
+                    hash_val = obj_info["hash"]
+                    dir_hash = hash_val[:2]
+                    path = os.path.join(objects_dir, dir_hash, hash_val)
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    if not os.path.exists(path) or not self.verify_file(path, hash_val):
+                        obj_url = f"https://resources.download.minecraft.net/{dir_hash}/{hash_val}"
+                        if self.download_with_retry(obj_url, path, f"asset {obj_name}", hash_val):
+                            downloaded += 1
+                        else:
+                            print(f"Failed to download asset {obj_name}, continuing...")
+                print(f"Downloaded {downloaded}/{total_assets} new assets.")
+        
+        # Libraries and natives
+        current_os = platform.system().lower()
+        if current_os == "darwin":
+            current_os = "osx"
+        libraries_dir = os.path.join(CTLAUNCHER_DIR, "libraries")
+        natives_dir = os.path.join(version_dir, "natives")
+        os.makedirs(libraries_dir, exist_ok=True)
+        os.makedirs(natives_dir, exist_ok=True)
+        
+        for lib in data.get("libraries", []):
+            if self.is_library_allowed(lib, current_os):
+                # Artifact
+                if "downloads" in lib and "artifact" in lib["downloads"]:
+                    lib_url = lib["downloads"]["artifact"]["url"]
+                    lib_path = os.path.join(libraries_dir, lib["downloads"]["artifact"]["path"])
+                    os.makedirs(os.path.dirname(lib_path), exist_ok=True)
+                    expected_sha1 = lib["downloads"]["artifact"]["sha1"]
+                    if not os.path.exists(lib_path) or not self.verify_file(lib_path, expected_sha1):
+                        self.download_with_retry(lib_url, lib_path, f"lib {lib.get('name', '')}", expected_sha1)
+                
+                # Natives
+                if "natives" in lib and current_os in lib["natives"]:
+                    classifier = lib["natives"][current_os]
+                    if "downloads" in lib and "classifiers" in lib["downloads"] and classifier in lib["downloads"]["classifiers"]:
+                        native_url = lib["downloads"]["classifiers"][classifier]["url"]
+                        native_path = os.path.join(natives_dir, f"{classifier}.jar")
+                        expected_sha1 = lib["downloads"]["classifiers"][classifier]["sha1"]
+                        if not os.path.exists(native_path) or not self.verify_file(native_path, expected_sha1):
+                            if self.download_with_retry(native_url, native_path, f"native {lib.get('name', '')}", expected_sha1):
+                                with zipfile.ZipFile(native_path, "r") as zip_ref:
+                                    zip_ref.extractall(natives_dir)
+                                os.remove(native_path)
+        
+        self.update_installations_listbox()
+        return True
+
+    def modify_options_txt(self, target_fps=60):
+        """Modify options.txt."""
+        options_path = os.path.join(CTLAUNCHER_DIR, "options.txt")
+        options = {}
+        if os.path.exists(options_path):
+            try:
+                with open(options_path, "r") as f:
+                    for line in f:
+                        parts = line.strip().split(":", 1)
+                        if len(parts) == 2:
+                            options[parts[0]] = parts[1]
+            except:
+                pass
+        options['maxFps'] = str(target_fps)
+        options['enableVsync'] = 'false'
+        os.makedirs(os.path.dirname(options_path), exist_ok=True)
+        with open(options_path, "w") as f:
+            for key, value in options.items():
+                f.write(f"{key}:{value}\n")
+
+    def is_library_allowed(self, lib, current_os):
+        """Check library rules."""
+        if "rules" not in lib:
+            return True
+        allowed = True
+        for rule in lib["rules"]:
+            if rule["action"] == "disallow" and ("os" not in rule or rule["os"].get("name") == current_os):
+                allowed = False
+            elif rule["action"] == "allow" and ("os" not in rule or rule["os"].get("name") == current_os):
+                allowed = True
+        return allowed
+
+    def evaluate_rules(self, rules, current_os):
+        """Evaluate arg rules."""
+        if not rules:
+            return True
+        allowed = True
+        for rule in rules:
+            if "features" in rule:
+                continue
+            if rule["action"] == "disallow" and ("os" not in rule or rule["os"].get("name") == current_os):
+                allowed = False
+            elif rule["action"] == "allow" and ("os" not in rule or rule["os"].get("name") == current_os):
+                allowed = True
+        return allowed
+
+    def generate_offline_uuid(self, username):
+        """Generate offline UUID."""
+        hash_value = hashlib.md5(f"OfflinePlayer:{username}".encode('utf-8')).hexdigest()
+        return f"{hash_value[:8]}-{hash_value[8:12]}-{hash_value[12:16]}-{hash_value[16:20]}-{hash_value[20:]}"
+
+    def build_launch_command(self, version, username, ram):
+        """Build launch command (fixed jvm_args replace)."""
+        version_dir = os.path.join(VERSIONS_DIR, version)
+        json_path = os.path.join(version_dir, f"{version}.json")
+        with open(json_path, "r") as f:
+            version_data = json.load(f)
+        
+        current_os = platform.system().lower()
+        if current_os == "darwin":
+            current_os = "osx"
+        
+        main_class = version_data.get("mainClass", "net.minecraft.client.main.Main")
+        libraries_dir = os.path.join(CTLAUNCHER_DIR, "libraries")
+        natives_dir = os.path.join(version_dir, "natives")
+        jar_path = os.path.join(version_dir, f"{version}.jar")
+        
+        classpath = [jar_path]
+        for lib in version_data.get("libraries", []):
+            if "downloads" in lib and "artifact" in lib["downloads"]:
+                lib_path = os.path.join(libraries_dir, lib["downloads"]["artifact"]["path"])
+                if os.path.exists(lib_path):
+                    classpath.append(lib_path)
+        
+        classpath_str = ";".join(classpath) if platform.system() == "Windows" else ":".join(classpath)
+        
+        java_bin = "java"
+        if not self.is_java_installed():
+            java_bin = os.path.join(JAVA_DIR, self.get_local_java_dir(), "bin", "java" + (".exe" if platform.system() == "Windows" else ""))
+        
+        command = [java_bin, f"-Xmx{ram}G"]
+        
+        jvm_args = []
+        if "arguments" in version_data and "jvm" in version_data["arguments"]:
+            for arg in version_data["arguments"]["jvm"]:
+                if isinstance(arg, str):
+                    jvm_args.append(arg)
+                elif isinstance(arg, dict) and self.evaluate_rules(arg.get("rules", []), current_os):
+                    if isinstance(arg["value"], list):
+                        jvm_args.extend(arg["value"])
+                    else:
+                        jvm_args.append(arg["value"])
+        
+        if platform.system() == "Darwin" and "-XstartOnFirstThread" not in jvm_args:
+            jvm_args.append("-XstartOnFirstThread")
+        if not any("-Djava.library.path=" in arg for arg in jvm_args):
+            jvm_args.append(f"-Djava.library.path={natives_dir}")
+        
+        command.extend(jvm_args)
+        
+        game_args = []
+        if "arguments" in version_data and "game" in version_data["arguments"]:
+            for arg in version_data["arguments"]["game"]:
+                if isinstance(arg, str):
+                    game_args.append(arg)
+                elif isinstance(arg, dict) and self.evaluate_rules(arg.get("rules", []), current_os):
+                    if isinstance(arg["value"], list):
+                        game_args.extend(arg["value"])
+                    else:
+                        game_args.append(arg["value"])
+        elif "minecraftArguments" in version_data:
+            game_args = version_data["minecraftArguments"].split()
+        
+        uuid = self.accounts.get(username, {}).get("uuid", self.generate_offline_uuid(username))
+        replacements = {
+            "${auth_player_name}": username,
+            "${version_name}": version,
+            "${game_directory}": CTLAUNCHER_DIR,
+            "${assets_root}": ASSETS_DIR,
+            "${assets_index_name}": version_data.get("assetIndex", {}).get("id", "legacy"),
+            "${auth_uuid}": uuid,
+            "${auth_access_token}": "0",
+            "${user_type}": "legacy",
+            "${version_type}": version_data.get("type", "release"),
+            "${user_properties}": "{}",
+            "${quickPlayRealms}": "",
+        }
+        
+        def replace(arg):
+            for key, value in replacements.items():
+                if isinstance(arg, str):
+                    arg = arg.replace(key, str(value))
+            return arg
+        
+        game_args = [replace(arg) for arg in game_args]
+        jvm_args = [replace(arg) for arg in jvm_args]
+        
+        command.extend(["-cp", classpath_str, main_class] + game_args)
+        return command
+
+    def prepare_and_launch(self, install_only=False):
+        """Prepare and launch."""
+        self.install_java_if_needed()
+        self.modify_options_txt()
+        self.download_and_launch(install_only)
+
+    def download_and_launch(self, install_only=False):
+        """Download and launch."""
+        version = self.version_combo.get()
+        if not version:
+            messagebox.showerror("Error", "Select a version.")
+            return
+        username = self.validate_username(self.current_account)
+        ram = int(self.ram_scale.get())
+        version_url = self.versions.get(version)
+        if not version_url:
+            messagebox.showerror("Error", f"Version {version} not found.")
+            return
+        if not self.download_version_files(version, version_url):
+            return
+        if install_only:
+            messagebox.showinfo("Success", f"{version} installed!")
+            return
+        launch_cmd = self.build_launch_command(version, username, ram)
+        if not launch_cmd:
+            return
+        print("Launching:", " ".join(launch_cmd))
+        try:
+            subprocess.Popen(launch_cmd)
+            close_on_launch = self.settings_vars.get("Close launcher when game starts", tk.BooleanVar(value=False)).get()
+            if close_on_launch:
+                self.withdraw()
+        except Exception as e:
+            messagebox.showerror("Error", f"Launch failed: {e}")
+
+    def validate_username(self, username):
+        """Validate username."""
+        if not username or not re.match(r'^[a-zA-Z0-9_]+$', username):
+            return "Player"
+        return username
+
+if __name__ == "__main__":
+    print("CTLauncher 2.1 - Initializing...")
+    app = CTLauncher()
+    app.mainloop()
